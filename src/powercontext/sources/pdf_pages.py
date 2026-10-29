@@ -40,8 +40,8 @@ from powercontext.sources import AdapterSourceDefinition, Source, SourceMaterial
 from powercontext.sources.projections import TEXT_EVIDENCE_PROJECTION_KEY
 
 if TYPE_CHECKING:
-    from powercontext.builtin.artifacts.memory.models import MemoryHit
     from powercontext.builtin.runtime.application import ScopedMemoryApplication
+    from powercontext.builtin.runtime.models import MemoryEntryRecord
 
 
 class PDFDocumentInput(BaseModel):
@@ -437,32 +437,19 @@ def _stem(word: str) -> str:
     return word
 
 
-def _query_plan(question: str) -> tuple[tuple[str, ...], dict[str, float]]:
+def _query_plan(question: str) -> tuple[str, dict[str, float]]:
     tokens = _tokens(question)
-    words = tuple(dict.fromkeys(w for w in tokens if w not in _STOP_WORDS))
-    probes = [" ".join(words)] if words else []
-    # Short probes avoid requiring every clause of a multi-statement question
-    # to appear on the same page during the Memory admission step.
-    probes.extend(" ".join(words[i : i + 3]) for i in range(0, len(words), 3))
+    words = tuple(dict.fromkeys(word for word in tokens if word not in _STOP_WORDS))
     weights = {_stem(word): 1.0 for word in words}
     terms = set(tokens)
     for triggers, alternatives in _CONCEPTS:
         if terms.intersection(triggers.split()):
-            probes.extend(alternatives)
             for word in _tokens(" ".join(alternatives)):
                 weights.setdefault(_stem(word), 0.55)
-    for request, _title, alternatives in _STATEMENTS:
-        if request.search(question):
-            probes.extend(alternatives)
-    # Memory FTS is lexical: a warranty/warranties mismatch cannot be fixed
-    # by stemming after retrieval. Each two-term probe admits either form.
-    for word in words:
-        if word.isalpha() and len(word) >= 4:
-            stem = _stem(word)
-            plural = f"{stem[:-1]}ies" if stem.endswith("y") else f"{stem}s"
-            variants = tuple(dict.fromkeys(form for form in (word, stem, plural) if _stem(form) == stem))
-            probes.extend(" ".join(variants[i : i + 2]) for i in range(0, len(variants), 2))
-    return tuple(dict.fromkeys(probes)), weights
+    # All active pages are admitted from public Memory records. Inflection and
+    # concept variants are therefore scored locally, without repeating full
+    # Memory searches for every spelling. FTS supplies a single lexical signal.
+    return " ".join(words), weights
 
 
 _COMPANY_SUFFIXES = frozenset({"inc", "incorporated", "corp", "corporation", "company", "co", "plc", "ltd", "limited"})
@@ -496,26 +483,8 @@ def _selected_reports(matches: Mapping[str, bool], years: set[str]) -> set[str]:
     return annual or named or set(matches)
 
 
-async def _active_pdf_hits(memory: ScopedMemoryApplication) -> list[MemoryHit]:
-    from powercontext.builtin.artifacts.memory.models import MemoryHit
-
-    records = await memory.list()
-    return [
-        MemoryHit(
-            memory_ref=record.memory_ref,
-            entry_id=record.entry.entry_id,
-            entry_version_id=record.entry.entry_version_id,
-            text=record.entry.text,
-            score=0.0,
-            matched_by=(),
-        )
-        for record in records.entries
-        if len(record.entry.sources) == 1 and record.entry.sources[0].source_type == "pdf-page"
-    ]
-
-
 def _rank_candidates(
-    hits: Sequence[MemoryHit], weights: Mapping[str, float], question: str, probes_ranks: Sequence[float]
+    hits: Sequence[MemoryEntryRecord], weights: Mapping[str, float], question: str, probes_ranks: Sequence[float]
 ) -> list[int]:
     if not hits:
         return []
@@ -530,7 +499,7 @@ def _rank_candidates(
     frequencies: Counter[str] = Counter()
     total_length = 0
     for hit in hits:
-        document_id, _separator, body = hit.text.partition("\n")
+        document_id, _separator, body = hit.entry.text.partition("\n")
         words = _tokens(body)
         count = Counter(stem for word in words if (stem := lexemes.get(word)) is not None)
         frequencies.update(count.keys())
@@ -593,46 +562,45 @@ async def search_pdf_pages(
 
     if limit <= 0 or not question.strip():
         return ()
-    queries, weights = _query_plan(question)
-    if not queries:
+    query, weights = _query_plan(question)
+    if not query:
         return ()
-    from powercontext.builtin.runtime import GetMemoryEntryRequest, SearchMemoryRequest
+    from powercontext.builtin.runtime import SearchMemoryRequest
 
     pool_limit = max(80, min(limit * 8, 320))
     # The lexical channel has a finite coarse pool. Capture active records
     # through the same public scoped Memory before ranking. These references
     # identify genuine persisted versions; no external index or files are used.
-    hits = await _active_pdf_hits(memory)
+    records = (await memory.list()).entries
+    hits = [
+        record
+        for record in records
+        if len(record.entry.sources) == 1 and record.entry.sources[0].source_type == "pdf-page"
+    ]
     positions = {
-        (hit.memory_ref.artifact_id, hit.memory_ref.revision, hit.entry_id, hit.entry_version_id): index
+        (hit.memory_ref.artifact_id, hit.memory_ref.revision, hit.entry.entry_id, hit.entry.entry_version_id): index
         for index, hit in enumerate(hits)
     }
     ranks = [0.0] * len(hits)
-    for query in queries:
-        page = await memory.search(SearchMemoryRequest(query=query, limit=pool_limit, mode="fts"))
-        for rank, hit in enumerate(page.hits, 1):
-            key = (hit.memory_ref.artifact_id, hit.memory_ref.revision, hit.entry_id, hit.entry_version_id)
-            # Search may include non-PDF evidence, or a newer Memory revision
-            # committed after list(). Score only the captured active PDF set;
-            # its exact historical citations remain readable in either case.
-            if key in positions:
-                ranks[positions[key]] += 1.0 / (60 + rank)
+    page = await memory.search(SearchMemoryRequest(query=query, limit=pool_limit, mode="fts"))
+    for rank, hit in enumerate(page.hits, 1):
+        key = (hit.memory_ref.artifact_id, hit.memory_ref.revision, hit.entry_id, hit.entry_version_id)
+        # Search may include non-PDF evidence, or a newer Memory revision
+        # committed after list(). Score only the captured active PDF set;
+        # its exact historical citations remain readable in either case.
+        if key in positions:
+            ranks[positions[key]] += 1.0 / (60 + rank)
     citations, seen = [], set()
     for index in _rank_candidates(hits, weights, question, ranks):
-        hit = hits[index]
-        citation = MemoryCitation(
-            memory_ref=hit.memory_ref, entry_id=hit.entry_id, entry_version_id=hit.entry_version_id
-        )
-        entry = (await memory.get(GetMemoryEntryRequest(citation=citation))).entry
-        # The page pipeline emits one page per entry. Exclude mixed evidence,
-        # which cannot be returned as an unambiguous single-page citation.
-        if len(entry.sources) != 1:
+        record = hits[index]
+        source_id = record.entry.sources[0].source_id
+        if source_id in seen:
             continue
-        source = entry.sources[0]
-        if source.source_type != "pdf-page" or source.source_id in seen:
-            continue
-        seen.add(source.source_id)
-        citations.append(citation)
+        seen.add(source_id)
+        # Return the exact citation supplied by this public Memory record.
+        # list() already read its persisted version and single-page evidence;
+        # no synthetic revision or repeated full-Memory read is needed here.
+        citations.append(record.citation)
         if len(citations) == limit:
             break
     return tuple(citations)
