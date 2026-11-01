@@ -531,3 +531,16 @@ def test_compressed_validation_honors_the_configured_memory_limit():
         assert tracemalloc.get_traced_memory()[1] < 4 * 1024 * 1024
     finally:
         tracemalloc.stop()
+
+
+@pytest.mark.parametrize("as_array", [False, True])
+def test_null_content_stays_a_legitimate_blank_page(as_array):
+    from pypdf.generic import ArrayObject, NullObject
+
+    writer = PdfWriter()
+    page = writer.add_blank_page(width=100, height=100)
+    page[NameObject("/Contents")] = ArrayObject([NullObject()]) if as_array else NullObject()
+    output = io.BytesIO()
+    writer.write(output)
+    pages = parse_pdf_document(PDFDocumentInput(document_id="blank", content=output.getvalue()))
+    assert [(p.page_number, p.text) for p in pages] == [(1, "")]

@@ -184,6 +184,8 @@ def _validate_page_content(page: DictionaryObject, checked: set[int]) -> None:
         if not isinstance(resolved, NullObject):
             for value in streams:
                 stream = value.get_object()
+                if isinstance(stream, NullObject):
+                    continue
                 if not isinstance(stream, StreamObject):
                     raise TypeError("Page content is not a stream")  # noqa: TRY003
                 _validate_text_stream(stream, checked)
@@ -211,7 +213,7 @@ def _form_invocations(
     counts: dict[tuple[int, int], int],
 ) -> int:
     """Validate executed Form paths before pypdf can recover by dropping them."""
-    if content is None:
+    if content is None or isinstance(content.get_object(), NullObject):
         return 0
     identity, key = id(content), (id(content), id(resources))
     if identity in ancestors:
@@ -221,7 +223,13 @@ def _form_invocations(
     ancestors.add(identity)
     total = 0
     try:
-        for operands, operator in ContentStream(content, reader).operations:
+        stream = ContentStream(content, reader)
+        # Root-page syntax is also parsed by extract_text(). Only Form streams
+        # need an unconditional extra syntax pass, because extraction swallows
+        # their errors. A missing literal Do rules out XObject invocations.
+        is_form = isinstance(content, StreamObject) and content.get("/Subtype") == "/Form"
+        operations = stream.operations if is_form or b"Do" in stream.get_data() else ()
+        for operands, operator in operations:
             if operator != b"Do":
                 continue
             target = _called_xobject(resources, operands)
