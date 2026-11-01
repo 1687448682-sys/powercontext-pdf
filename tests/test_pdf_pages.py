@@ -93,7 +93,7 @@ def test_permissions_and_password_protection():
 async def test_definition_identity_projection_and_revision():
     registry = SourceDefinitionRegistry((PDF_PAGE_SOURCE_DEFINITION,))
     raw = _pdf("First page", "Second page")
-    document_id = " document:with/delimiters " + "财报" * 200
+    document_id = " document:with/delimiters " + "璐㈡姤" * 200
     pages = parse_pdf_document(PDFDocumentInput(document_id=document_id, content=raw))
     source = await registry.resolve(pages[0])
     assert source.materialization == SourceMaterialization.CAPTURED
@@ -453,3 +453,81 @@ async def test_question_fiscal_year_selects_the_requested_report(tmp_path):
         assert len(citations) == 1
         entry = (await memory.get(GetMemoryEntryRequest(citation=citations[0]))).entry
         assert entry.text.startswith("ACME_2022_10K\n")
+
+
+def _form_pdf(kind: str) -> bytes:
+    from pypdf.generic import ArrayObject, NumberObject
+
+    writer = PdfWriter(clone_from=PdfReader(io.BytesIO(_pdf("Complete first page", "second"))))
+    page = writer.pages[-1]
+    form = DecodedStreamObject()
+    form.set_data(b"BT (unterminated" if kind == "broken_form" else b"BT /F1 12 Tf (Embedded revenue 123) Tj ET")
+    form[NameObject("/Subtype")] = NameObject("/Form")
+    form[NameObject("/BBox")] = ArrayObject([NumberObject(x) for x in (0, 0, 100, 100)])
+    form[NameObject("/Resources")] = DictionaryObject({NameObject("/Font"): page["/Resources"]["/Font"]})
+    objects = DictionaryObject({NameObject("/F0"): writer._add_object(form)})
+    page[NameObject("/Resources")][NameObject("/XObject")] = objects
+    if kind == "cyclic_form":
+        form.set_data(b"q /F0 Do Q")
+        form["/Resources"][NameObject("/XObject")] = objects
+    stream = DecodedStreamObject()
+    stream.set_data(b"q /F1 Do Q" if kind == "missing_xobject" else b"q /F0 Do Q q /F0 Do Q")
+    page[NameObject("/Contents")] = writer._add_object(stream)
+    if kind == "shared_form":
+        extra = writer.add_blank_page(width=300, height=400)
+        extra[NameObject("/Resources")] = page["/Resources"]
+        extra[NameObject("/Contents")] = page["/Contents"]
+    out = io.BytesIO()
+    writer.write(out)
+    return out.getvalue()
+
+
+@pytest.mark.parametrize("kind", ["broken_form", "missing_xobject", "cyclic_form"])
+def test_form_failures_cannot_silently_drop_a_late_page(kind):
+    with pytest.raises(ValueError):
+        parse_pdf_document(PDFDocumentInput(document_id="forms", content=_form_pdf(kind)))
+
+
+def test_shared_form_is_fully_extracted_for_each_invocation_and_page():
+    pages = parse_pdf_document(PDFDocumentInput(document_id="forms", content=_form_pdf("shared_form")))
+    assert pages[0].text == "Complete first page"
+    assert len(pages) == 3
+    assert [page.text.count("Embedded revenue 123") for page in pages[1:]] == [2, 2]
+
+
+def test_form_invocation_budget_failure_is_atomic():
+    from pypdf import apply_configuration, get_configuration
+
+    with (
+        apply_configuration(get_configuration().with_overwrites(xform_maximum_invocations_per_extraction=1)),
+        pytest.raises(ValueError),
+    ):
+        parse_pdf_document(PDFDocumentInput(document_id="forms", content=_form_pdf("valid")))
+
+
+def test_compressed_validation_honors_the_configured_memory_limit():
+    import tracemalloc
+    import zlib
+
+    from pypdf import apply_configuration, get_configuration
+    from pypdf.generic import EncodedStreamObject
+
+    writer = PdfWriter(clone_from=PdfReader(io.BytesIO(_pdf("first", "second"))))
+    stream = EncodedStreamObject()
+    stream._data = zlib.compress(b" " * (8 * 1024 * 1024))
+    stream[NameObject("/Filter")] = NameObject("/FlateDecode")
+    writer.pages[-1][NameObject("/Contents")] = writer._add_object(stream)
+    raw = io.BytesIO()
+    writer.write(raw)
+    tracemalloc.start()
+    try:
+        with (
+            apply_configuration(get_configuration().with_overwrites(zlib_maximum_output_length=1024)),
+            pytest.raises(ValueError),
+        ):
+            parse_pdf_document(PDFDocumentInput(document_id="compressed", content=raw.getvalue()))
+        # Validation must not allocate the full 8 MiB payload before pypdf's
+        # configured limit gets a chance to reject it.
+        assert tracemalloc.get_traced_memory()[1] < 4 * 1024 * 1024
+    finally:
+        tracemalloc.stop()

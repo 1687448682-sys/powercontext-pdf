@@ -31,9 +31,18 @@ from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
-from pypdf import PdfReader
+from pypdf import PdfReader, get_configuration
 from pypdf.filters import decode_stream_data
-from pypdf.generic import ArrayObject, DictionaryObject, NameObject, NullObject, NumberObject, PdfObject, StreamObject
+from pypdf.generic import (
+    ArrayObject,
+    ContentStream,
+    DictionaryObject,
+    NameObject,
+    NullObject,
+    NumberObject,
+    PdfObject,
+    StreamObject,
+)
 
 from powercontext.artifacts import MemoryCitation
 from powercontext.sources import AdapterSourceDefinition, Source, SourceMaterialization, TextEvidence
@@ -130,8 +139,10 @@ def _validate_text_stream(stream: StreamObject, checked: set[int]) -> None:
     for filter_name, parameter in _stream_filters(stream):
         if filter_name in ("/FlateDecode", "/Fl"):
             decoder = zlib.decompressobj()
-            decoder.decompress(data)
-            decoder.flush()
+            limit = get_configuration().zlib_maximum_output_length
+            length = len(decoder.decompress(data, limit + 1 if limit else 0))
+            if limit and (length > limit or decoder.unconsumed_tail):
+                raise ValueError("Compressed text exceeds the configured output limit")  # noqa: TRY003
             if not decoder.eof:
                 raise ValueError("Truncated compressed text stream")  # noqa: TRY003
         stage = StreamObject()
@@ -179,6 +190,51 @@ def _validate_page_content(page: DictionaryObject, checked: set[int]) -> None:
     _validate_resources(page.get("/Resources"), checked)
 
 
+def _called_xobject(resources: PdfObject | None, operands: Sequence[PdfObject]) -> StreamObject:
+    resources = resources.get_object() if resources is not None else None
+    objects = resources.get("/XObject") if isinstance(resources, DictionaryObject) else None
+    objects = objects.get_object() if objects is not None else None
+    if len(operands) != 1 or not isinstance(operands[0], NameObject) or not isinstance(objects, DictionaryObject):
+        raise ValueError("Invalid XObject invocation")  # noqa: TRY003
+    reference = objects.get(operands[0])
+    target = reference.get_object() if reference is not None else None
+    if not isinstance(target, StreamObject):
+        raise TypeError("Missing invoked XObject")  # noqa: TRY003
+    return target
+
+
+def _form_invocations(
+    content: PdfObject | None,
+    resources: PdfObject | None,
+    reader: PdfReader,
+    ancestors: set[int],
+    counts: dict[tuple[int, int], int],
+) -> int:
+    """Validate executed Form paths before pypdf can recover by dropping them."""
+    if content is None:
+        return 0
+    identity, key = id(content), (id(content), id(resources))
+    if identity in ancestors:
+        raise ValueError("Cyclic Form XObject invocation")  # noqa: TRY003
+    if key in counts:
+        return counts[key]
+    ancestors.add(identity)
+    total = 0
+    try:
+        for operands, operator in ContentStream(content, reader).operations:
+            if operator != b"Do":
+                continue
+            target = _called_xobject(resources, operands)
+            if target.get("/Subtype") == "/Form":
+                total += 1 + _form_invocations(target, target.get("/Resources", resources), reader, ancestors, counts)
+                if total > get_configuration().xform_maximum_invocations_per_extraction:
+                    raise ValueError("Form invocation limit would truncate extracted text")  # noqa: TRY003
+        counts[key] = total
+        return total
+    finally:
+        ancestors.remove(identity)
+
+
 def parse_pdf_document(value: PDFDocumentInput) -> tuple[PDFPageInput, ...]:
     """Extract every page, or fail without publishing a partial document.
 
@@ -200,9 +256,11 @@ def parse_pdf_document(value: PDFDocumentInput) -> tuple[PDFPageInput, ...]:
             if len(pages) != expected:
                 raise ValueError("Not all physical pages could be read")  # noqa: TRY003, TRY301
             checked: set[int] = set()
+            form_counts: dict[tuple[int, int], int] = {}
             result = []
             for number, page in enumerate(pages, 1):
                 _validate_page_content(page, checked)
+                _form_invocations(page.get("/Contents"), page.get("/Resources"), reader, set(), form_counts)
                 result.append(
                     PDFPageInput(
                         document_id=value.document_id,
@@ -511,23 +569,23 @@ def _rank_candidates(
         for word, weight in weights.items()
     }
     question_words = tuple(word for word in _tokens(question) if word not in _COMPANY_SUFFIXES)
+    company_words = {identity: _company_words(identity) for identity in {item[0] for item in documents}}
+    company_stems = {identity: {_stem(word) for word in words} for identity, words in company_words.items()}
     document_matches = {
-        identity: _mentions_document(_company_words(identity), question_words)
-        for identity in {item[0] for item in documents}
+        identity: _mentions_document(words, question_words) for identity, words in company_words.items()
     }
-    matched: list[bool] = []
     question_years = set(_YEAR.findall(question))
+    matching_years = {
+        identity: bool(question_years.intersection(_YEAR.findall(identity))) for identity in company_words
+    }
     requested_titles = tuple(title for request, title, _probes in _STATEMENTS if request.search(question))
     scores = []
     for index, (document_id, count, length, heading) in enumerate(documents):
-        company_words = _company_words(document_id)
-        company_stems = {_stem(word) for word in company_words}
-        matched.append(document_matches[document_id])
         score = 0.0
         normalization = 1.2 * (0.35 + 0.65 * length / average)
         for word, weighted_idf in weighted_idfs.items():
             # Company and year select a document, rather than a topic.
-            if word in question_years or word in company_stems:
+            if word in question_years or word in company_stems[document_id]:
                 continue
             frequency = count[word]
             if frequency:
@@ -538,9 +596,9 @@ def _rank_candidates(
             for match in (title.search(heading),)
         )
         score = score * (1.0 + 0.5 * title_matches) + 8.0 * title_matches
-        if matched[-1]:
+        if document_matches[document_id]:
             score *= 1.8
-        if question_years.intersection(re.findall(r"(?:19|20)\d{2}", document_id)):
+        if matching_years[document_id]:
             score *= 1.15
         # Preserve the exact fusion weight and stable tie order.
         score += 4.0 * probes_ranks[index]
@@ -577,6 +635,8 @@ async def search_pdf_pages(
         for record in records
         if len(record.entry.sources) == 1 and record.entry.sources[0].source_type == "pdf-page"
     ]
+    if not hits:
+        return ()
     positions = {
         (hit.memory_ref.artifact_id, hit.memory_ref.revision, hit.entry.entry_id, hit.entry.entry_version_id): index
         for index, hit in enumerate(hits)
