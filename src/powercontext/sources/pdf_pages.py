@@ -153,20 +153,28 @@ def _validate_text_stream(stream: StreamObject, checked: set[int]) -> None:
         data = decode_stream_data(stage)
 
 
+def _resource_dictionary(value: PdfObject | None) -> DictionaryObject | None:
+    if value is None:
+        return None
+    resolved = value.get_object()
+    if isinstance(resolved, NullObject):
+        return None
+    if not isinstance(resolved, DictionaryObject):
+        raise TypeError("Invalid PDF resource dictionary")  # noqa: TRY003
+    return resolved
+
+
 def _validate_resources(resources: PdfObject | None, checked: set[int]) -> None:
-    if resources is None or isinstance(resources, NullObject):
+    resources = _resource_dictionary(resources)
+    if resources is None:
         return
-    resources = resources.get_object()
-    if not isinstance(resources, DictionaryObject):
-        raise TypeError("Missing page resources")  # noqa: TRY003
-    objects = resources.get("/XObject")
+    objects = _resource_dictionary(resources.get("/XObject"))
     if objects is None:
         return
-    objects = objects.get_object()
-    if not isinstance(objects, DictionaryObject):
-        raise TypeError("Missing page XObjects")  # noqa: TRY003
     for reference in objects.values():
         form = reference.get_object()
+        if isinstance(form, NullObject):
+            continue
         if not isinstance(form, StreamObject):
             raise TypeError("Missing XObject stream")  # noqa: TRY003
         if form.get("/Subtype") == "/Form" and id(form) not in checked:
@@ -527,26 +535,46 @@ def _company_words(document_id: str) -> tuple[str, ...]:
     return tuple(word for word in _tokens(label) if word not in _COMPANY_SUFFIXES)
 
 
-def _mentions_document(words: tuple[str, ...], question_words: tuple[str, ...]) -> bool:
+def _mention_spans(words: tuple[str, ...], question_words: tuple[str, ...]) -> set[tuple[int, int]]:
     label = "".join(words)
     if len(label) < 2 or label in _STOP_WORDS:
-        return False
+        return set()
     # Contiguous token windows accept punctuation and joined company names,
     # including short identifiers and names such as 3M, without substring
     # matches inside an unrelated company's name.
+    spans = set()
     for start in range(len(question_words)):
         for end in range(start + 1, min(len(question_words), start + len(words) + 3) + 1):
             if "".join(question_words[start:end]) == label:
-                return True
-    return False
+                spans.add((start, end))
+    return spans
+
+
+def _document_matches(companies: Mapping[str, tuple[str, ...]], question_words: tuple[str, ...]) -> dict[str, bool]:
+    spans = {identity: _mention_spans(words, question_words) for identity, words in companies.items()}
+    all_spans = set().union(*spans.values())
+    # Suppress a short company name only where its entire occurrence is part
+    # of a longer named company. Separate mentions in comparisons survive.
+    maximal = {
+        span
+        for span in all_spans
+        if not any(start <= span[0] and span[1] <= end and (start, end) != span for start, end in all_spans)
+    }
+    return {identity: bool(matches & maximal) for identity, matches in spans.items()}
 
 
 def _selected_reports(matches: Mapping[str, bool], years: set[str]) -> set[str]:
     named = {identity for identity, match in matches.items() if match}
-    # An explicit year can distinguish annual reports of the named company.
-    # If no corresponding report exists, retain its available reports.
-    annual = {identity for identity in named if years.intersection(_YEAR.findall(identity))}
-    return annual or named or set(matches)
+    groups: dict[str, set[str]] = {}
+    for identity in named:
+        groups.setdefault("".join(_company_words(identity)), set()).add(identity)
+    selected = set()
+    # A matching report for one company must not eliminate another company's
+    # available report, which can discuss the requested year as a future plan.
+    for identities in groups.values():
+        annual = {identity for identity in identities if years.intersection(_YEAR.findall(identity))}
+        selected.update(annual or identities)
+    return selected or set(matches)
 
 
 def _rank_candidates(
@@ -579,9 +607,7 @@ def _rank_candidates(
     question_words = tuple(word for word in _tokens(question) if word not in _COMPANY_SUFFIXES)
     company_words = {identity: _company_words(identity) for identity in {item[0] for item in documents}}
     company_stems = {identity: {_stem(word) for word in words} for identity, words in company_words.items()}
-    document_matches = {
-        identity: _mentions_document(words, question_words) for identity, words in company_words.items()
-    }
+    document_matches = _document_matches(company_words, question_words)
     question_years = set(_YEAR.findall(question))
     matching_years = {
         identity: bool(question_years.intersection(_YEAR.findall(identity))) for identity in company_words

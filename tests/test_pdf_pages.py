@@ -544,3 +544,100 @@ def test_null_content_stays_a_legitimate_blank_page(as_array):
     writer.write(output)
     pages = parse_pdf_document(PDFDocumentInput(document_id="blank", content=output.getvalue()))
     assert [(p.page_number, p.text) for p in pages] == [(1, "")]
+
+
+@pytest.mark.parametrize(
+    "kind", ["direct_resources", "indirect_resources", "null_xobjects", "indirect_xobjects", "unused_null"]
+)
+def test_optional_null_resources_do_not_reject_blank_pages(kind):
+    from pypdf.generic import NullObject
+
+    writer = PdfWriter(clone_from=PdfReader(io.BytesIO(_pdf("Complete first page", ""))))
+    page = writer.pages[-1]
+    if kind in ("direct_resources", "indirect_resources"):
+        resource = NullObject()
+        page[NameObject("/Resources")] = writer._add_object(resource) if kind.startswith("indirect") else resource
+    else:
+        resource = DictionaryObject({NameObject("/Unused"): NullObject()}) if kind == "unused_null" else NullObject()
+        page["/Resources"][NameObject("/XObject")] = (
+            writer._add_object(resource) if kind.startswith("indirect") else resource
+        )
+    output = io.BytesIO()
+    writer.write(output)
+    pages = parse_pdf_document(PDFDocumentInput(document_id="resources", content=output.getvalue()))
+    assert [(p.page_number, p.text) for p in pages] == [(1, "Complete first page"), (2, "")]
+
+
+@pytest.mark.parametrize("indirect", [False, True])
+def test_invoking_a_null_resource_still_fails_atomically(indirect):
+    from pypdf.generic import NullObject
+
+    writer = PdfWriter(clone_from=PdfReader(io.BytesIO(_pdf("Complete first page", "second"))))
+    page = writer.pages[-1]
+    target = writer._add_object(NullObject()) if indirect else NullObject()
+    page["/Resources"][NameObject("/XObject")] = DictionaryObject({NameObject("/Missing"): target})
+    stream = DecodedStreamObject()
+    stream.set_data(b"q /Missing Do Q")
+    page[NameObject("/Contents")] = writer._add_object(stream)
+    output = io.BytesIO()
+    writer.write(output)
+    with pytest.raises(ValueError):
+        parse_pdf_document(PDFDocumentInput(document_id="missing", content=output.getvalue()))
+
+
+@pytest.mark.parametrize("scenario", ["long_name_only", "both_names", "separate_years"])
+async def test_company_name_and_year_selection_preserve_requested_documents(tmp_path, scenario):
+    from powercontext.builtin.persistence.sqlite import SQLiteConfig
+    from powercontext.builtin.runtime import (
+        BuiltinConfig,
+        GetMemoryEntryRequest,
+        SubmitSourceObservation,
+        open_builtin_runtime,
+    )
+    from powercontext.builtin.scope import ScopeDraft
+    from powercontext.sources import manifest_for_definition
+
+    if scenario == "long_name_only":
+        documents = (
+            (
+                "ACME_2022_10K",
+                ["Total product warranty reserves in the industries business. Warranty reserve 999."] * 24,
+            ),
+            ("ACME_INDUSTRIES_2022_10K", ["Product warranties reserve 100."]),
+        )
+        question = "What warranty reserve does Acme Industries report in FY2022?"
+        expected = {"ACME_INDUSTRIES_2022_10K"}
+    elif scenario == "both_names":
+        documents = (
+            ("ACME_2022_10K", ["Product warranty reserve 999."]),
+            ("ACME_INDUSTRIES_2022_10K", ["Product warranties reserve 100."]),
+        )
+        question = "Compare Acme and Acme Industries warranty reserves in FY2022."
+        expected = {identity for identity, _texts in documents}
+    else:
+        documents = (
+            ("ALPHA_2022_10K", ["Revenue 2022 total 100."]),
+            ("BETA_2021_10K", ["Report published FY2021; committed 2022 restructuring expenses 200."]),
+        )
+        question = "What 2022 restructuring expenses are reported by Alpha and Beta?"
+        expected = {identity for identity, _texts in documents}
+    config = BuiltinConfig(database=SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'companies.db'}"))
+    registry = SourceDefinitionRegistry((PDF_PAGE_SOURCE_DEFINITION,))
+    async with open_builtin_runtime(config, candidate_pipeline=_PagePipeline()) as runtime:
+        scope = await runtime.scopes.create(
+            ScopeDraft(title="Companies", summary="Company selection", idempotency_key="companies")
+        )
+        await runtime.ingestion.register(manifest_for_definition(PDF_PAGE_SOURCE_DEFINITION))
+        for identity, texts in documents:
+            for page in parse_pdf_document(PDFDocumentInput(document_id=identity, content=_pdf(*texts))):
+                source = project_source_for_transport(registry, await registry.resolve(page))
+                await runtime.ingestion.submit(SubmitSourceObservation(scope_id=scope.scope_id, observation=source))
+        while (await runtime.memory.for_scope(scope.scope_id).flush()).processed:
+            pass
+    async with open_builtin_runtime(config) as runtime:
+        memory = runtime.memory.for_scope(scope.scope_id)
+        citations = await search_pdf_pages(memory, question, limit=20)
+        assert citations and len(citations) <= 20
+        entries = [(await memory.get(GetMemoryEntryRequest(citation=citation))).entry for citation in citations]
+        assert {entry.text.split("\n", 1)[0] for entry in entries} == expected
+        assert len({entry.sources[0].source_id for entry in entries}) == len(citations)
